@@ -8,31 +8,81 @@ const SUPABASE_KEY = "sb_publishable_9-xANiS8jgcoITOYNGrQtg_3MWUZpm8";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+const FORM_INICIAL = {
+  habitacion_id: "",
+  huesped_principal: "",
+  telefono: "",
+  fecha_entrada: "",
+  fecha_salida: "",
+  adultos: 1,
+  ninos_0_6: 0,
+  ninos_7_10: 0,
+  observaciones: "",
+};
+
+function obtenerHoyParaguay() {
+  const partes = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Asuncion",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+
+  const year = partes.find((p) => p.type === "year")?.value;
+  const month = partes.find((p) => p.type === "month")?.value;
+  const day = partes.find((p) => p.type === "day")?.value;
+
+  return `${year}-${month}-${day}`;
+}
+
+function formatoGs(valor) {
+  return `${new Intl.NumberFormat("es-PY").format(
+    Number(valor || 0)
+  )} Gs`;
+}
+
+function formatoFecha(fecha) {
+  if (!fecha) return "—";
+
+  const [year, month, day] = fecha.split("-");
+  return `${day}/${month}/${year}`;
+}
+
 export default function Home() {
   const [ingreso, setIngreso] = useState(false);
+
   const [habitaciones, setHabitaciones] = useState([]);
   const [reservas, setReservas] = useState([]);
-  const [cargando, setCargando] = useState(true);
-  const [mostrarReserva, setMostrarReserva] = useState(false);
-  const [mensaje, setMensaje] = useState("");
+  const [tarifas, setTarifas] = useState([]);
 
-  const [form, setForm] = useState({
-    habitacion_id: "",
-    huesped_principal: "",
-    telefono: "",
-    fecha_entrada: "",
-    fecha_salida: "",
-    adultos: 1,
-    ninos_0_6: 0,
-    ninos_7_10: 0,
-    observaciones: "",
-  });
+  const [cargando, setCargando] = useState(true);
+  const [guardando, setGuardando] = useState(false);
+  const [procesando, setProcesando] = useState("");
+
+  const [mostrarReserva, setMostrarReserva] = useState(false);
+  const [mostrarCanceladas, setMostrarCanceladas] = useState(false);
+
+  const [mensaje, setMensaje] = useState("");
+  const [esError, setEsError] = useState(false);
+
+  const [form, setForm] = useState(FORM_INICIAL);
+
+  const hoy = obtenerHoyParaguay();
+
+  function mostrarExito(texto) {
+    setEsError(false);
+    setMensaje(texto);
+  }
+
+  function mostrarError(texto) {
+    setEsError(true);
+    setMensaje(texto);
+  }
 
   async function cargarDatos() {
     setCargando(true);
-    setMensaje("");
 
-    const [respuestaHabitaciones, respuestaReservas] = await Promise.all([
+    const [h, r, t] = await Promise.all([
       supabase
         .from("habitaciones")
         .select("*")
@@ -42,21 +92,31 @@ export default function Home() {
       supabase
         .from("reservas")
         .select("*")
-        .neq("estado", "cancelada")
         .order("fecha_entrada", { ascending: true }),
+
+      supabase
+        .from("tarifas")
+        .select("*")
+        .eq("activa", true)
+        .order("cantidad_personas", { ascending: true }),
     ]);
 
-    if (respuestaHabitaciones.error || respuestaReservas.error) {
-      setMensaje(
-        "Error de conexión: " +
-          (
-            respuestaHabitaciones.error ||
-            respuestaReservas.error
-          )?.message
-      );
+    if (h.error) {
+      mostrarError("Error habitaciones: " + h.error.message);
     } else {
-      setHabitaciones(respuestaHabitaciones.data || []);
-      setReservas(respuestaReservas.data || []);
+      setHabitaciones(h.data || []);
+    }
+
+    if (r.error) {
+      mostrarError("Error reservas: " + r.error.message);
+    } else {
+      setReservas(r.data || []);
+    }
+
+    if (t.error) {
+      mostrarError("Error tarifas: " + t.error.message);
+    } else {
+      setTarifas(t.data || []);
     }
 
     setCargando(false);
@@ -66,33 +126,72 @@ export default function Home() {
     cargarDatos();
   }, []);
 
-  const hoy = new Date().toISOString().slice(0, 10);
-
-  const habitacionesOcupadas = useMemo(() => {
-    return new Set(
-      reservas
-        .filter(
-          (reserva) =>
-            reserva.fecha_entrada <= hoy &&
-            reserva.fecha_salida > hoy &&
-            reserva.estado !== "cancelada"
-        )
-        .map((reserva) => reserva.habitacion_id)
-    );
-  }, [reservas, hoy]);
-
-  const totalPersonas =
-    Number(form.adultos || 0) +
-    Number(form.ninos_0_6 || 0) +
-    Number(form.ninos_7_10 || 0);
-
-  const habitacionSeleccionada = habitaciones.find(
-    (habitacion) =>
-      String(habitacion.id) === String(form.habitacion_id)
+  const reservasActivas = useMemo(
+    () =>
+      reservas.filter(
+        (r) =>
+          r.estado !== "cancelada" &&
+          r.estado !== "check_out"
+      ),
+    [reservas]
   );
 
+  const reservasFinalizadas = useMemo(
+    () =>
+      reservas.filter(
+        (r) =>
+          r.estado === "cancelada" ||
+          r.estado === "check_out"
+      ),
+    [reservas]
+  );
+
+  /*
+    IMPORTANTE:
+    Una reserva de mañana NO cuenta como ocupada hoy.
+    La salida tampoco cuenta como noche ocupada.
+  */
+  const habitacionesOcupadasHoy = useMemo(() => {
+    return new Set(
+      reservasActivas
+        .filter(
+          (r) =>
+            r.fecha_entrada <= hoy &&
+            r.fecha_salida > hoy
+        )
+        .map((r) => Number(r.habitacion_id))
+    );
+  }, [reservasActivas, hoy]);
+
+  const adultos = Number(form.adultos || 0);
+  const ninosGratis = Number(form.ninos_0_6 || 0);
+  const ninosMitad = Number(form.ninos_7_10 || 0);
+
+  const totalPersonas =
+    adultos + ninosGratis + ninosMitad;
+
+  const habitacionSeleccionada = habitaciones.find(
+    (h) =>
+      String(h.id) === String(form.habitacion_id)
+  );
+
+  function obtenerTarifa(cantidad) {
+    return tarifas.find(
+      (t) =>
+        Number(t.cantidad_personas) === Number(cantidad)
+    );
+  }
+
   function precioPorCantidad(cantidad) {
-    const precios = {
+    if (cantidad <= 0) return 0;
+
+    const tarifa = obtenerTarifa(cantidad);
+
+    if (tarifa) {
+      return Number(tarifa.precio_guaranies || 0);
+    }
+
+    const respaldo = {
       1: 200000,
       2: 400000,
       3: 540000,
@@ -102,134 +201,503 @@ export default function Home() {
       7: 1330000,
     };
 
-    return precios[cantidad] || 0;
+    return respaldo[cantidad] || 0;
   }
 
   function calcularTotal() {
-    const adultos = Number(form.adultos || 0);
-    const ninosMedios = Number(form.ninos_7_10 || 0);
+    const precioAdultos =
+      adultos > 0 ? precioPorCantidad(adultos) : 0;
 
-    const precioAdultos = precioPorCantidad(adultos);
-
-    const precioIndividual =
+    const valorPersona =
       adultos > 0
         ? precioAdultos / adultos
         : precioPorCantidad(1);
 
-    return Math.round(
-      precioAdultos + ninosMedios * precioIndividual * 0.5
-    );
-  }
+    const precioNinos =
+      ninosMitad * valorPersona * 0.5;
 
-  function formatoGs(valor) {
-    return new Intl.NumberFormat("es-PY").format(valor || 0) + " Gs";
+    return Math.round(precioAdultos + precioNinos);
   }
 
   async function guardarReserva(evento) {
     evento.preventDefault();
+
+    if (guardando) return;
+
     setMensaje("");
 
     if (!form.habitacion_id) {
-      setMensaje("Seleccioná una habitación.");
+      mostrarError("Seleccioná una habitación.");
       return;
     }
 
     if (!form.huesped_principal.trim()) {
-      setMensaje("Ingresá el nombre del huésped.");
+      mostrarError("Ingresá el nombre del huésped.");
       return;
     }
 
     if (!form.fecha_entrada || !form.fecha_salida) {
-      setMensaje("Completá la fecha de entrada y salida.");
+      mostrarError("Completá entrada y salida.");
       return;
     }
 
     if (form.fecha_salida <= form.fecha_entrada) {
-      setMensaje(
+      mostrarError(
         "La fecha de salida debe ser posterior a la entrada."
       );
       return;
     }
 
     if (totalPersonas < 1) {
-      setMensaje("Debe haber al menos una persona.");
+      mostrarError("Debe haber al menos una persona.");
       return;
     }
 
     if (
       habitacionSeleccionada &&
-      totalPersonas > habitacionSeleccionada.capacidad_maxima
+      totalPersonas >
+        Number(habitacionSeleccionada.capacidad_maxima)
     ) {
-      setMensaje(
-        `La habitación ${habitacionSeleccionada.numero} admite como máximo ${habitacionSeleccionada.capacidad_maxima} personas.`
+      mostrarError(
+        `La habitación ${habitacionSeleccionada.numero} admite máximo ${habitacionSeleccionada.capacidad_maxima} personas.`
       );
       return;
     }
 
-    const total = calcularTotal();
+    setGuardando(true);
 
-    const { error } = await supabase.from("reservas").insert({
-      habitacion_id: Number(form.habitacion_id),
-      huesped_principal: form.huesped_principal.trim(),
-      telefono: form.telefono.trim() || null,
-      fecha_entrada: form.fecha_entrada,
-      fecha_salida: form.fecha_salida,
-      adultos: Number(form.adultos || 0),
-      ninos_0_6: Number(form.ninos_0_6 || 0),
-      ninos_7_10: Number(form.ninos_7_10 || 0),
-      total_personas: totalPersonas,
-      precio_base: total,
-      descuento: 0,
-      total,
-      estado: "reservada",
-      estado_pago: "pendiente",
-      desayuno: true,
-      observaciones: form.observaciones.trim() || null,
-    });
+    try {
+      /*
+        Comprobamos superposición:
+        entrada existente < nueva salida
+        Y salida existente > nueva entrada.
+      */
+      const { data: ocupaciones, error: errorDisponibilidad } =
+        await supabase
+          .from("reservas")
+          .select("id")
+          .eq("habitacion_id", Number(form.habitacion_id))
+          .neq("estado", "cancelada")
+          .neq("estado", "check_out")
+          .lt("fecha_entrada", form.fecha_salida)
+          .gt("fecha_salida", form.fecha_entrada);
 
-    if (error) {
-      if (
-        error.code === "23P01" ||
-        error.message?.toLowerCase().includes("conflict") ||
-        error.message?.toLowerCase().includes("exclusion")
-      ) {
-        setMensaje(
-          "Esa habitación ya tiene una reserva en esas fechas."
-        );
-      } else {
-        setMensaje("No se pudo guardar: " + error.message);
+      if (errorDisponibilidad) {
+        throw errorDisponibilidad;
       }
 
-      return;
+      if (ocupaciones?.length > 0) {
+        mostrarError(
+          "Esa habitación ya está reservada en esas fechas."
+        );
+        return;
+      }
+
+      const tarifa = obtenerTarifa(Math.max(adultos, 1));
+      const total = calcularTotal();
+
+      const { data: creada, error: errorInsert } =
+        await supabase
+          .from("reservas")
+          .insert([
+            {
+              habitacion_id: Number(form.habitacion_id),
+
+              huesped_principal:
+                form.huesped_principal.trim(),
+
+              telefono:
+                form.telefono.trim() || null,
+
+              fecha_entrada: form.fecha_entrada,
+              fecha_salida: form.fecha_salida,
+
+              hora_checkin: "12:00",
+              hora_checkout: "10:00",
+
+              adultos,
+              ninos_0_6: ninosGratis,
+              ninos_7_10: ninosMitad,
+              total_personas: totalPersonas,
+
+              tarifa_id: tarifa?.id || null,
+
+              precio_base: total,
+              descuento: 0,
+              total,
+
+              estado: "reservada",
+              estado_pago: "pendiente",
+
+              desayuno: true,
+
+              observaciones:
+                form.observaciones.trim() || null,
+            },
+          ])
+          .select()
+          .single();
+
+      if (errorInsert) {
+        if (errorInsert.code === "23P01") {
+          mostrarError(
+            "Esa habitación ya está reservada en esas fechas."
+          );
+        } else {
+          mostrarError(
+            "No se pudo guardar: " + errorInsert.message
+          );
+        }
+
+        return;
+      }
+
+      if (!creada?.id) {
+        mostrarError(
+          "No se pudo confirmar la reserva."
+        );
+        return;
+      }
+
+      setForm(FORM_INICIAL);
+      setMostrarReserva(false);
+
+      await cargarDatos();
+
+      mostrarExito(
+        "Reserva guardada correctamente."
+      );
+    } catch (err) {
+      mostrarError(
+        "No se pudo guardar: " +
+          (err?.message || "Error desconocido")
+      );
+    } finally {
+      setGuardando(false);
+    }
+  }
+
+  async function actualizarReserva(
+    reserva,
+    cambios,
+    mensajeCorrecto
+  ) {
+    if (procesando) return;
+
+    setProcesando(reserva.id);
+    setMensaje("");
+
+    try {
+      const { data, error: errorUpdate } =
+        await supabase
+          .from("reservas")
+          .update(cambios)
+          .eq("id", reserva.id)
+          .select()
+          .single();
+
+      if (errorUpdate) {
+        mostrarError(
+          "No se pudo actualizar: " +
+            errorUpdate.message
+        );
+        return;
+      }
+
+      if (!data?.id) {
+        mostrarError(
+          "No se pudo confirmar el cambio."
+        );
+        return;
+      }
+
+      await cargarDatos();
+      mostrarExito(mensajeCorrecto);
+    } catch (err) {
+      mostrarError(
+        "Error: " +
+          (err?.message || "Error desconocido")
+      );
+    } finally {
+      setProcesando("");
+    }
+  }
+
+  async function confirmarPago(reserva) {
+    const ok = window.confirm(
+      `¿Confirmar pago de ${formatoGs(
+        reserva.total
+      )} de ${reserva.huesped_principal}?`
+    );
+
+    if (!ok) return;
+
+    await actualizarReserva(
+      reserva,
+      { estado_pago: "pagado" },
+      "Pago confirmado correctamente."
+    );
+  }
+
+  async function pagoPendiente(reserva) {
+    const ok = window.confirm(
+      "¿Volver a marcar este pago como pendiente?"
+    );
+
+    if (!ok) return;
+
+    await actualizarReserva(
+      reserva,
+      { estado_pago: "pendiente" },
+      "Pago marcado como pendiente."
+    );
+  }
+
+  async function cancelarReserva(reserva) {
+    const ok = window.confirm(
+      `¿Cancelar la reserva de ${reserva.huesped_principal}?\n\nLa habitación quedará libre nuevamente para esas fechas.`
+    );
+
+    if (!ok) return;
+
+    await actualizarReserva(
+      reserva,
+      { estado: "cancelada" },
+      "Reserva cancelada. Habitación liberada."
+    );
+  }
+
+  async function checkIn(reserva) {
+    const ok = window.confirm(
+      `¿Registrar CHECK-IN de ${reserva.huesped_principal}?`
+    );
+
+    if (!ok) return;
+
+    await actualizarReserva(
+      reserva,
+      { estado: "check_in" },
+      "Check-in registrado."
+    );
+  }
+
+  async function checkOut(reserva) {
+    const ok = window.confirm(
+      `¿Registrar CHECK-OUT de ${reserva.huesped_principal}?`
+    );
+
+    if (!ok) return;
+
+    await actualizarReserva(
+      reserva,
+      { estado: "check_out" },
+      "Check-out registrado. Habitación liberada."
+    );
+  }
+
+  function textoEstado(estado) {
+    switch (estado) {
+      case "reservada":
+        return "Reservada";
+      case "check_in":
+        return "Hospedado";
+      case "check_out":
+        return "Finalizada";
+      case "cancelada":
+        return "Cancelada";
+      default:
+        return estado || "—";
+    }
+  }
+
+  function colorEstado(estado) {
+    if (estado === "cancelada") {
+      return {
+        background: "#F3E3DF",
+        color: "#A35C4E",
+      };
     }
 
-    setForm({
-      habitacion_id: "",
-      huesped_principal: "",
-      telefono: "",
-      fecha_entrada: "",
-      fecha_salida: "",
-      adultos: 1,
-      ninos_0_6: 0,
-      ninos_7_10: 0,
-      observaciones: "",
-    });
+    if (estado === "check_out") {
+      return {
+        background: "#ECEAE5",
+        color: "#746E62",
+      };
+    }
 
-    setMostrarReserva(false);
-    setMensaje("Reserva guardada correctamente.");
+    if (estado === "check_in") {
+      return {
+        background: "#E4EEE0",
+        color: "#496640",
+      };
+    }
 
-    await cargarDatos();
+    return {
+      background: "#EAF0E6",
+      color: "#55704C",
+    };
+  }
+
+  function TarjetaReserva({ reserva, historial = false }) {
+    const habitacion = habitaciones.find(
+      (h) =>
+        Number(h.id) ===
+        Number(reserva.habitacion_id)
+    );
+
+    const ocupado =
+      procesando === reserva.id;
+
+    return (
+      <div style={estilos.reserva}>
+        <div style={estilos.reservaArriba}>
+          <div style={{ flex: 1 }}>
+            <strong style={estilos.nombreReserva}>
+              {reserva.huesped_principal}
+            </strong>
+
+            <span style={estilos.detalle}>
+              Habitación {habitacion?.numero || "—"} ·{" "}
+              {reserva.total_personas} huésped
+              {Number(reserva.total_personas) !== 1
+                ? "es"
+                : ""}
+            </span>
+
+            <span style={estilos.detalle}>
+              {formatoFecha(reserva.fecha_entrada)} →{" "}
+              {formatoFecha(reserva.fecha_salida)}
+            </span>
+
+            {reserva.telefono && (
+              <span style={estilos.detalle}>
+                Tel. {reserva.telefono}
+              </span>
+            )}
+
+            <strong style={estilos.total}>
+              {formatoGs(reserva.total)}
+            </strong>
+          </div>
+
+          <span
+            style={{
+              ...estilos.estado,
+              ...colorEstado(reserva.estado),
+            }}
+          >
+            {textoEstado(reserva.estado)}
+          </span>
+        </div>
+
+        {!historial && (
+          <>
+            <div style={estilos.pago}>
+              <span>Pago</span>
+
+              <strong
+                style={{
+                  color:
+                    reserva.estado_pago === "pagado"
+                      ? "#55704C"
+                      : "#A48650",
+                }}
+              >
+                {reserva.estado_pago === "pagado"
+                  ? "PAGADO"
+                  : reserva.estado_pago === "parcial"
+                  ? "PARCIAL"
+                  : "PENDIENTE"}
+              </strong>
+            </div>
+
+            <div style={estilos.acciones}>
+              {reserva.estado_pago !== "pagado" && (
+                <button
+                  type="button"
+                  disabled={ocupado}
+                  style={estilos.botonPago}
+                  onClick={() => confirmarPago(reserva)}
+                >
+                  CONFIRMAR PAGO
+                </button>
+              )}
+
+              {reserva.estado_pago === "pagado" && (
+                <button
+                  type="button"
+                  disabled={ocupado}
+                  style={estilos.botonSecundario}
+                  onClick={() => pagoPendiente(reserva)}
+                >
+                  MARCAR PAGO PENDIENTE
+                </button>
+              )}
+
+              {reserva.estado === "reservada" && (
+                <button
+                  type="button"
+                  disabled={ocupado}
+                  style={estilos.botonCheck}
+                  onClick={() => checkIn(reserva)}
+                >
+                  HACER CHECK-IN
+                </button>
+              )}
+
+              {reserva.estado === "check_in" && (
+                <button
+                  type="button"
+                  disabled={ocupado}
+                  style={estilos.botonCheck}
+                  onClick={() => checkOut(reserva)}
+                >
+                  HACER CHECK-OUT
+                </button>
+              )}
+
+              <button
+                type="button"
+                disabled={ocupado}
+                style={estilos.botonCancelar}
+                onClick={() => cancelarReserva(reserva)}
+              >
+                CANCELAR RESERVA
+              </button>
+            </div>
+
+            {ocupado && (
+              <div style={estilos.procesando}>
+                Procesando...
+              </div>
+            )}
+          </>
+        )}
+
+        {historial && (
+          <div style={estilos.historialTexto}>
+            {reserva.estado === "cancelada"
+              ? "Reserva cancelada · Habitación liberada"
+              : "Estadía finalizada"}
+          </div>
+        )}
+      </div>
+    );
   }
 
   if (!ingreso) {
     return (
       <main style={estilos.portada}>
         <section style={estilos.centro}>
-          <div style={estilos.hotel}>HOTEL BOUTIQUE</div>
+          <div style={estilos.hotel}>
+            HOTEL BOUTIQUE
+          </div>
 
           <h1 style={estilos.logo}>JABIRÚ</h1>
 
-          <p style={estilos.subtitulo}>Gestión del hotel</p>
+          <p style={estilos.subtitulo}>
+            Gestión del hotel
+          </p>
 
           <button
             type="button"
@@ -252,7 +720,10 @@ export default function Home() {
       <section style={estilos.contenedor}>
         <header style={estilos.header}>
           <div>
-            <div style={estilos.hotel}>HOTEL BOUTIQUE</div>
+            <div style={estilos.hotel}>
+              HOTEL BOUTIQUE
+            </div>
+
             <h1 style={estilos.titulo}>JABIRÚ</h1>
           </div>
 
@@ -268,7 +739,19 @@ export default function Home() {
         <h2 style={estilos.h2}>Administración</h2>
 
         {mensaje && (
-          <div style={estilos.mensaje}>{mensaje}</div>
+          <div
+            style={{
+              ...estilos.mensaje,
+              background: esError
+                ? "#F6E4E0"
+                : "#E7EFE3",
+              color: esError
+                ? "#A05446"
+                : "#496640",
+            }}
+          >
+            {mensaje}
+          </div>
         )}
 
         <div style={estilos.resumen}>
@@ -281,7 +764,7 @@ export default function Home() {
 
           <div style={estilos.tarjetaResumen}>
             <strong style={estilos.numero}>
-              {habitacionesOcupadas.size}
+              {habitacionesOcupadasHoy.size}
             </strong>
             <span>Ocupadas hoy</span>
           </div>
@@ -290,7 +773,7 @@ export default function Home() {
             <strong style={estilos.numero}>
               {Math.max(
                 habitaciones.length -
-                  habitacionesOcupadas.size,
+                  habitacionesOcupadasHoy.size,
                 0
               )}
             </strong>
@@ -339,13 +822,9 @@ export default function Home() {
                 Seleccionar habitación
               </option>
 
-              {habitaciones.map((habitacion) => (
-                <option
-                  key={habitacion.id}
-                  value={habitacion.id}
-                >
-                  Habitación {habitacion.numero} —{" "}
-                  {habitacion.tipo}
+              {habitaciones.map((h) => (
+                <option key={h.id} value={h.id}>
+                  Habitación {h.numero} — {h.tipo}
                 </option>
               ))}
             </select>
@@ -434,6 +913,7 @@ export default function Home() {
                   style={estilos.input}
                   type="number"
                   min="0"
+                  max="7"
                   value={form.adultos}
                   onChange={(e) =>
                     setForm({
@@ -453,6 +933,7 @@ export default function Home() {
                   style={estilos.input}
                   type="number"
                   min="0"
+                  max="7"
                   value={form.ninos_0_6}
                   onChange={(e) =>
                     setForm({
@@ -472,6 +953,7 @@ export default function Home() {
                   style={estilos.input}
                   type="number"
                   min="0"
+                  max="7"
                   value={form.ninos_7_10}
                   onChange={(e) =>
                     setForm({
@@ -517,9 +999,15 @@ export default function Home() {
 
             <button
               type="submit"
-              style={estilos.botonGuardar}
+              disabled={guardando}
+              style={{
+                ...estilos.botonGuardar,
+                opacity: guardando ? 0.6 : 1,
+              }}
             >
-              GUARDAR RESERVA
+              {guardando
+                ? "GUARDANDO..."
+                : "GUARDAR RESERVA"}
             </button>
           </form>
         )}
@@ -531,54 +1019,46 @@ export default function Home() {
         {cargando ? (
           <p>Cargando...</p>
         ) : (
-          habitaciones.map((habitacion) => {
+          habitaciones.map((h) => {
             const ocupada =
-              habitacionesOcupadas.has(habitacion.id);
+              habitacionesOcupadasHoy.has(Number(h.id));
 
             return (
               <div
-                key={habitacion.id}
+                key={h.id}
                 style={estilos.habitacion}
               >
                 <div style={estilos.circulo}>
-                  {habitacion.numero}
+                  {h.numero}
                 </div>
 
                 <div style={{ flex: 1 }}>
                   <strong style={estilos.tipo}>
-                    {habitacion.tipo}
+                    {h.tipo}
                   </strong>
 
                   <span style={estilos.detalle}>
-                    {habitacion.camas_matrimoniales >
-                      0 &&
-                      `${habitacion.camas_matrimoniales} matrimonial${
-                        habitacion.camas_matrimoniales >
-                        1
+                    {h.camas_matrimoniales > 0 &&
+                      `${h.camas_matrimoniales} matrimonial${
+                        h.camas_matrimoniales > 1
                           ? "es"
                           : ""
                       }`}
 
-                    {habitacion.camas_matrimoniales >
-                      0 &&
-                      habitacion.camas_individuales >
-                        0 &&
+                    {h.camas_matrimoniales > 0 &&
+                      h.camas_individuales > 0 &&
                       " + "}
 
-                    {habitacion.camas_individuales >
-                      0 &&
-                      `${habitacion.camas_individuales} individual${
-                        habitacion.camas_individuales >
-                        1
+                    {h.camas_individuales > 0 &&
+                      `${h.camas_individuales} individual${
+                        h.camas_individuales > 1
                           ? "es"
                           : ""
                       }`}
                   </span>
 
                   <span style={estilos.detalle}>
-                    Máximo{" "}
-                    {habitacion.capacidad_maxima}{" "}
-                    personas
+                    Máximo {h.capacidad_maxima} personas
                   </span>
                 </div>
 
@@ -593,9 +1073,7 @@ export default function Home() {
                       : "#55704C",
                   }}
                 >
-                  {ocupada
-                    ? "Ocupada"
-                    : "Disponible"}
+                  {ocupada ? "Ocupada" : "Disponible"}
                 </span>
               </div>
             );
@@ -603,54 +1081,54 @@ export default function Home() {
         )}
 
         <h3 style={estilos.seccion}>
-          Reservas
+          Reservas activas
         </h3>
 
-        {reservas.length === 0 ? (
+        {reservasActivas.length === 0 ? (
           <div style={estilos.vacio}>
-            Todavía no hay reservas.
+            No hay reservas activas.
           </div>
         ) : (
-          reservas.slice(0, 20).map((reserva) => {
-            const habitacion = habitaciones.find(
-              (h) => h.id === reserva.habitacion_id
-            );
+          reservasActivas.map((reserva) => (
+            <TarjetaReserva
+              key={reserva.id}
+              reserva={reserva}
+            />
+          ))
+        )}
 
-            return (
-              <div
-                key={reserva.id}
-                style={estilos.reserva}
-              >
-                <div>
-                  <strong>
-                    {reserva.huesped_principal}
-                  </strong>
+        <button
+          type="button"
+          style={estilos.botonHistorial}
+          onClick={() =>
+            setMostrarCanceladas(!mostrarCanceladas)
+          }
+        >
+          {mostrarCanceladas
+            ? "OCULTAR HISTORIAL"
+            : `VER HISTORIAL (${reservasFinalizadas.length})`}
+        </button>
 
-                  <span style={estilos.detalle}>
-                    Habitación{" "}
-                    {habitacion?.numero || "—"} ·{" "}
-                    {reserva.total_personas} huésped
-                    {reserva.total_personas !== 1
-                      ? "es"
-                      : ""}
-                  </span>
+        {mostrarCanceladas && (
+          <>
+            <h3 style={estilos.seccion}>
+              Historial
+            </h3>
 
-                  <span style={estilos.detalle}>
-                    {reserva.fecha_entrada} →{" "}
-                    {reserva.fecha_salida}
-                  </span>
-
-                  <span style={estilos.detalle}>
-                    {formatoGs(reserva.total)}
-                  </span>
-                </div>
-
-                <span style={estilos.estado}>
-                  {reserva.estado}
-                </span>
+            {reservasFinalizadas.length === 0 ? (
+              <div style={estilos.vacio}>
+                No hay reservas finalizadas o canceladas.
               </div>
-            );
-          })
+            ) : (
+              reservasFinalizadas.map((reserva) => (
+                <TarjetaReserva
+                  key={reserva.id}
+                  reserva={reserva}
+                  historial
+                />
+              ))
+            )}
+          </>
         )}
       </section>
     </main>
@@ -774,11 +1252,11 @@ const estilos = {
   },
 
   mensaje: {
-    background: "#FFFFFF",
     padding: 12,
     borderRadius: 10,
     marginBottom: 14,
     fontSize: 13,
+    fontWeight: 600,
   },
 
   formulario: {
@@ -839,7 +1317,7 @@ const estilos = {
 
   seccion: {
     margin: "28px 0 10px",
-    fontSize: 18,
+    fontSize: 20,
   },
 
   habitacion: {
@@ -873,27 +1351,122 @@ const estilos = {
   detalle: {
     display: "block",
     color: "#817866",
-    fontSize: 11,
-    marginTop: 3,
+    fontSize: 12,
+    marginTop: 4,
   },
 
   estado: {
-    fontSize: 10,
+    fontSize: 11,
     borderRadius: 20,
-    padding: "6px 8px",
-    background: "#EAF0E6",
-    color: "#55704C",
+    padding: "7px 10px",
     whiteSpace: "nowrap",
+    height: "fit-content",
   },
 
   reserva: {
+    background: "#FFFFFF",
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 10,
+  },
+
+  reservaArriba: {
     display: "flex",
     justifyContent: "space-between",
     gap: 10,
+  },
+
+  nombreReserva: {
+    display: "block",
+    fontSize: 17,
+    marginBottom: 5,
+  },
+
+  total: {
+    display: "block",
+    marginTop: 7,
+    fontSize: 14,
+  },
+
+  pago: {
+    display: "flex",
+    justifyContent: "space-between",
+    marginTop: 13,
+    paddingTop: 11,
+    borderTop: "1px solid #EEE8DD",
+    fontSize: 12,
+  },
+
+  acciones: {
+    display: "grid",
+    gap: 7,
+    marginTop: 11,
+  },
+
+  botonPago: {
+    width: "100%",
+    border: 0,
+    borderRadius: 9,
+    padding: 12,
+    background: "#A48650",
+    color: "#FFFFFF",
+    fontWeight: 700,
+  },
+
+  botonCheck: {
+    width: "100%",
+    border: 0,
+    borderRadius: 9,
+    padding: 12,
+    background: "#4E5B43",
+    color: "#FFFFFF",
+    fontWeight: 700,
+  },
+
+  botonSecundario: {
+    width: "100%",
+    border: "1px solid #C9BEAA",
+    borderRadius: 9,
+    padding: 11,
     background: "#FFFFFF",
-    borderRadius: 12,
-    padding: 13,
-    marginBottom: 8,
+    color: "#706857",
+    fontWeight: 700,
+  },
+
+  botonCancelar: {
+    width: "100%",
+    border: "1px solid #DABBB4",
+    borderRadius: 9,
+    padding: 11,
+    background: "#FFFFFF",
+    color: "#A35C4E",
+    fontWeight: 700,
+  },
+
+  botonHistorial: {
+    width: "100%",
+    marginTop: 20,
+    border: "1px solid #C9BEAA",
+    borderRadius: 10,
+    padding: 12,
+    background: "transparent",
+    color: "#706857",
+    fontWeight: 700,
+  },
+
+  procesando: {
+    textAlign: "center",
+    marginTop: 8,
+    fontSize: 12,
+    color: "#817866",
+  },
+
+  historialTexto: {
+    marginTop: 10,
+    paddingTop: 10,
+    borderTop: "1px solid #EEE8DD",
+    fontSize: 11,
+    color: "#817866",
   },
 
   vacio: {
